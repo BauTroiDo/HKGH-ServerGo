@@ -1,2 +1,52 @@
+# Binaries
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Build outputs
+bin/
+build/
+dist/
+coverage.out
+
+# Logs - IMPORTANT TO EXCLUDE HUGE FILES
 log/
-*.log*
+*.log
+*.log.*
+stderr.log
+stderr.txt
+stdout.log
+stdout.txt
+t11_*.err
+t11_*.out
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Environment variables with secrets
+.env
+.env.local
+.env.production
+
+# Sensitive data
+secrets.json
+passwords.txt
+credentials.yml
+
+# Backup files
+*.bak
+*.backup
+*.old
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temp files
+tmp/
+temp/
+*.tmp

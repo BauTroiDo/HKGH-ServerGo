@@ -33,14 +33,14 @@ func (c *Config) Read() {
 	}
 
 	// read values from configuration...
-	c.Port = conf.GetInt("network", "port", 1321) // Legacy V21 port (was 16100)
+	c.Port = conf.GetInt("network", "port", 16100)
 	c.CashWeb_URL = conf.GetString("client", "cashweb_url", "")
 	c.CashWeb_Odc_URL = conf.GetString("client", "cashweb_odc_url", "")
 	c.CashWeb_Charge_URL = conf.GetString("client", "cashweb_charge_url", "")
 	c.GuildWeb_URL = conf.GetString("client", "guildweb_url", "")
 	c.Sns_URL = conf.GetString("client", "sns_url", "")
 
-	c.MasterIp = conf.GetString("master", "ip", "127.0.0.1") // Fixed typo: was "1270.0.1"
+	c.MasterIp = conf.GetString("master", "ip", "1270.0.1")
 	c.MasterPort = conf.GetInt("master", "port", 9001)
 
 	c.ScriptDirectory = conf.GetString("script", "directory", "")

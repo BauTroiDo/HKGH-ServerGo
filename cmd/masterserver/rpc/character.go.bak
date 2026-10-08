@@ -1,0 +1,360 @@
+package rpc
+
+import (
+	"time"
+
+	"github.com/jmoiron/sqlx"
+	"github.com/rxjh-emu/server/share/log"
+	"github.com/rxjh-emu/server/share/models"
+	"github.com/rxjh-emu/server/share/models/character"
+	"github.com/rxjh-emu/server/share/models/world"
+	"github.com/rxjh-emu/server/share/rpc"
+	"github.com/samber/lo"
+)
+
+// Load characters RPC call
+func LoadCharacters(c *rpc.Client, r *character.ListReq, s *character.ListRes) error {
+	var db = g_DatabaseManager.Get(r.Server)
+	var res = character.ListRes{List: make([]character.Character, 0)}
+
+	if db == nil {
+		*s = res
+		return nil
+	}
+
+	// get characters from database
+	// var characters = make([]character.Character, 0)
+	// db.Select(&characters, "SELECT * FROM characters WHERE account = ? ORDER BY slot ASC", r.Account)
+	// res.Characters = characters
+
+	// The five columns this project's schema inherited from an MU style character row
+	// (ki, spr, str, stm, dex) are not selected: the reference has no equivalent to
+	// them, because a V21 character's four basic attributes come out of its job formula
+	// rather than off its row (PlayersBes.cs:15515). Honor and karma do have columns,
+	// and so do the sect and the rebirth count a promotion quest writes. The two
+	// production columns are selected for the opposite reason: the reference reads
+	// them with the row (:9313, :9315) and writes them back with the save (:18225-18226),
+	// so leaving them out of the SELECT would load a zero the archive then stores as the
+	// real skill, losing it on the next relog.
+	//
+	// `pills` is selected for that same reason, and it stands in for the reference's FLD_ITIME
+	// read (PlayersBes.cs:10406, inside the ReadCharacterData that builds the character), the
+	// read whose :10575 BlockCopy hands the login replay its sixteen bytes. A character whose
+	// column carries nothing simply owns no pills, because the decode answers an empty
+	// dictionary for a value the blob never filled: an absent value costs the character its
+	// pills and never its row, which is what the three quest columns already promise too.
+	var rows, err = db.Queryx(
+		"SELECT "+
+			"id, name, slot, class, level, exp, fame, "+
+			"morals, hp, mp, rp, gender, hair, hair_color, face, voice, money, "+
+			"sect, job_level, fight_exp, vip_point, "+
+			"production_trade, production_skill, "+
+			"qigong_point, qigong, kongfu, ascension, ascension_points, "+
+			"quest, quest_finish, quest_item, pills, "+
+			"fb_time, hd_time "+
+			"FROM characters "+
+			"WHERE account = ?", r.Account)
+
+	if err != nil {
+		log.Error("[DATABASE]", err)
+		*s = res
+		return nil
+	}
+
+	// iterate over each row
+	for rows.Next() {
+		var c = character.Character{}
+		var err = rows.StructScan(&c)
+
+		if err == nil {
+			c.Position = loadPosition(db, c.Id)
+			res.List = append(res.List, c)
+		} else {
+			log.Error("[DATABASE]", err)
+			*s = res
+			return nil
+		}
+	}
+
+	stampWallet(res.List, r.Account)
+
+	*s = res
+	return nil
+}
+
+// stampWallet copies the account's four numbers onto every character of the list. The
+// reference reads them off the account row rather than the character row (Players.cs:30023,
+// :30215 and :47321 all select FLD_RXPIONT, FLD_RXPIONTX, FLD_VIP and FLD_VIPTIM from
+// [TBL_ACCOUNT]), so a login's four characters share one wallet, and the sharing has to
+// survive this server's load the same way.
+func stampWallet(list []character.Character, account int) {
+	var wallet struct {
+		Cash      int       `db:"cash"`
+		CashTotal int       `db:"cash_total"`
+		Vip       int       `db:"vip"`
+		VipUntil  time.Time `db:"vip_until"`
+	}
+	err := g_LoginDatabase.Get(&wallet,
+		"SELECT cash, cash_total, vip, vip_until FROM accounts WHERE id = ?", account)
+	if err != nil {
+		// The four numbers stay at zero, and the zero expiry is what tells the archive
+		// below that this character never got a wallet, so a failed read cannot wipe one.
+		log.Errorf("[ACCOUNT] %d has no wallet to load: %v", account, err)
+		return
+	}
+
+	for i := range list {
+		list[i].Cash = wallet.Cash
+		list[i].CashTotal = wallet.CashTotal
+		list[i].Vip = wallet.Vip
+		list[i].VipUntil = wallet.VipUntil
+	}
+}
+
+// orEmpty turns the absent half of an optional archive field into the empty value
+// the database can actually hold.
+func orEmpty(b []byte) []byte {
+	if b == nil {
+		return []byte{}
+	}
+	return b
+}
+
+// local function to load character position
+func loadPosition(db *sqlx.DB, id int) world.Position {
+	var position = world.Position{}
+	var err = db.Get(&position,
+		"SELECT map, x, y, z "+
+			"FROM characters "+
+			"WHERE id = ?", id)
+
+	if err != nil {
+		log.Error("[DATABASE]", err)
+	}
+
+	return position
+}
+
+// CheckCharacterName RPC Call
+func CheckCharacterName(c *rpc.Client, r *character.CheckNameReq, s *character.CheckNameRes) error {
+	var db = g_DatabaseManager.Get(r.Server)
+	var res = character.CheckNameRes{}
+
+	var name = 0
+	db.Get(&name, "SELECT id FROM characters WHERE name = ? LIMIT 1", r.Name)
+	if name > 0 {
+		res.Result = character.NameInUse
+		*s = res
+		return nil
+	}
+
+	res.Result = character.NameCanUse
+	*s = res
+	return nil
+}
+
+// CreateCharacter RPC Call
+func CreateCharacter(c *rpc.Client, r *character.CreateCharacterReq, s *character.CreateCharacterRes) error {
+	var db = g_DatabaseManager.Get(r.Server)
+	var res = character.CreateCharacterRes{}
+
+	// get initial data
+	init, found := lo.Find(g_DataLoader.Jobs, func(j models.InitialJob) bool {
+		return j.ID == r.Class
+	})
+	if !found {
+		log.Errorf("[CHARACTER] job %d has no initial data row", r.Class)
+		*s = res
+		return nil
+	}
+
+	// Four characters is the whole of one account's list: the reference counts the
+	// rows the account already has and refuses before it reaches the procedure
+	// (RxjhClass.cs:835-840), because the client only ever draws slots nought
+	// through three.
+	var held int
+	if err := db.Get(&held, "SELECT COUNT(*) FROM characters WHERE account = ?", r.AccountId); err != nil {
+		log.Error("[DATABASE]", err)
+		*s = res
+		return nil
+	}
+	if held >= character.SlotsPerAccount {
+		log.Debugf("CreateCharacter refused: account %d already holds %d characters", r.AccountId, held)
+		res.Result = character.CreateCharacterFail
+		*s = res
+		return nil
+	}
+
+	// get free slot from characters table by function
+	var slot = 0
+	db.Get(&slot, "SELECT getCharacterFreeSlot(?)", r.AccountId)
+
+	log.Debugf("CreateCharacter slot: %d", slot)
+
+	// The five MU style columns stay out of the insert as well: their defaults of zero
+	// are what a reference character of the same job and level would read as, since the
+	// numbers they once carried are computed from the level now. The two production
+	// columns are named and filled with their zero default, because the reference creates
+	// the row through a stored procedure that does not mention them (:9313, :9315) and a
+	// fresh character therefore arrives having learned no trade and with no skill.
+	var sql = "INSERT INTO characters ("
+	sql += "account, name, slot, class, level, fame, "
+	sql += "morals, hp, mp, rp, gender, hair, hair_color, face, voice, map, x, y, z, "
+	sql += "production_trade, production_skill"
+	sql += ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+
+	// The two bands a new character is written with are the job formula's own first
+	// level (PlayersBes.cs:15515), not a row of the initial data file: enter world
+	// rebuilds them from the same formula anyway, and the file's numbers were copied from
+	// a scheme that had no such formula and disagrees with five of the thirteen jobs.
+	start := character.BaseFor(r.Class, 1, 0)
+
+	result := db.MustExec(sql,
+		r.AccountId,
+		r.Name,
+		slot,
+		r.Class,
+		1,
+		0,
+		0,
+		start.HP,
+		start.MP,
+		init.Stats.Rp,
+		r.Gender,
+		r.Hair,
+		r.HairColor,
+		r.Face,
+		r.Voice,
+		init.Location.Map,
+		init.Location.X,
+		init.Location.Y,
+		init.Location.Z,
+		0,
+		0,
+	)
+	lastID, _ := result.LastInsertId()
+	log.Debugf("CreateCharacter result: %d", lastID)
+	if lastID <= 0 {
+		res.Result = character.CreateCharacterFail
+		*s = res
+		return nil
+	}
+
+	// The character arrives in the world carrying something: the weapon of its own
+	// job, the assistant item, and the starter gift pack, in the luggage slots the
+	// reference lays them out in (RxjhClass.cs:752-833). Money is not part of it -
+	// the procedure the reference calls never writes the money column, so a new
+	// character reads as broke (PlayersBes.cs:9264-9273).
+	if err := storeStarterItems(db, int(lastID), init); err != nil {
+		log.Errorf("[CHARACTER] %d could not be given its starting items: %v", lastID, err)
+		res.Result = character.CreateCharacterFail
+		*s = res
+		return nil
+	}
+
+	res.Result = character.CreateCharacterSuccess
+	*s = res
+	return nil
+}
+
+// storeStarterItems writes the new character's first bag. It runs on the same
+// connection as the insert rather than through the gameserver's save, because a
+// character with no row of its own yet has nobody to ask it for its serials.
+func storeStarterItems(db *sqlx.DB, characterID int, init models.InitialJob) error {
+	for _, row := range init.StarterItems(characterID) {
+		item := row.Item
+		if _, err := db.Exec(
+			"INSERT INTO items (id, owner, container, slot, pid, amount, data) VALUES (?, ?, ?, ?, ?, ?, ?)",
+			item.Serial(), characterID, row.Container, row.Index, item.PID(), item.Amount(), item.Data,
+		); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// characterArchiveStatement is the UPDATE ArchiveCharacter issues, statement and arguments
+// built in the same place so the positional pairing the driver relies on is something a test
+// can weigh rather than something only a live database would notice.
+func characterArchiveStatement(r *character.ArchiveReq) (string, []any) {
+	// Every blob is a NOT NULL column, and a character that has never spent a
+	// qi-gong point, learned a martial art or taken a quest carries them as nothing
+	// at all rather than as an empty buffer, which the driver would send as NULL. An
+	// empty FLD_KONGFU is exactly what the reference writes for such a character, so
+	// that is what goes back.
+	qigong, kongfu := orEmpty(r.QigongSlots), orEmpty(r.Kongfu)
+	ascension := orEmpty(r.Ascension)
+	quests, finished, items := orEmpty(r.Quests), orEmpty(r.Finished), orEmpty(r.QItems)
+	pills := orEmpty(r.Pills)
+
+	return "UPDATE characters SET level = ?, exp = ?, hp = ?, mp = ?, map = ?, x = ?, y = ?, z = ?, " +
+			"qigong_point = ?, qigong = ?, kongfu = ?, ascension = ?, ascension_points = ?, " +
+			"quest = ?, quest_finish = ?, quest_item = ?, pills = ?, " +
+			"sect = ?, job_level = ?, fame = ?, morals = ?, " +
+			"fight_exp = ?, vip_point = ?, fb_time = ?, hd_time = ?, " +
+			"production_trade = ?, production_skill = ? WHERE id = ?",
+		[]any{
+			r.Level, r.Exp, r.Hp, r.Mp, r.Map, r.X, r.Y, r.Z,
+			r.QigongPoint, qigong, kongfu, ascension, r.AscensionPoints,
+			quests, finished, items, pills,
+			r.Sect, r.JobLevel, r.Fame, r.Morals,
+			r.FightExp, r.VipPoint, r.TrainingRemaining, r.ActivityRemaining,
+			r.ProductionTrade, r.ProductionSkill, r.Id,
+		}
+}
+
+// ArchiveCharacter writes back the numbers a character changed while it stood in
+// the world: what a kill earned it, how far its bands have grown, and where it is
+// last standing.
+//
+// The reference runs this for every online character on its own timer
+// (Form1.cs:1203 → menuItem17_Click → Players.SaveCharacterData), not only when a
+// session ends, so a gameserver that crashes loses three minutes of levels rather
+// than a whole session.
+func ArchiveCharacter(c *rpc.Client, r *character.ArchiveReq, s *character.ArchiveRes) error {
+	var db = g_DatabaseManager.Get(r.Server)
+	var res = character.ArchiveRes{}
+
+	if db == nil {
+		*s = res
+		return nil
+	}
+
+	query, args := characterArchiveStatement(r)
+	result, err := db.Exec(query, args...)
+	if err != nil {
+		log.Errorf("[CHARACTER] %d could not be archived: %v", r.Id, err)
+		*s = res
+		return nil
+	}
+
+	// The wallet and the membership belong to the account, not to this row, so they go to
+	// the login database on their own statement - the reference's own split, where
+	// Save_CashData (:18634) and SaveMemberData (:18660) are two calls that both key by
+	// Userid. A failure here costs the balance and nothing else: the character above is
+	// already saved, and the reference's two saves are no more atomic than this one.
+	//
+	// A zero expiry is the marker for a wallet this process never read, because the column
+	// is NOT NULL with an epoch default and stampWallet only leaves the four numbers alone
+	// when its own SELECT failed. Writing that snapshot back would spend the failure twice
+	// and empty a real balance, and the reference has no such path: its save always follows
+	// a load of the same row.
+	if r.VipUntil.IsZero() {
+		log.Errorf("[ACCOUNT] %d holds a wallet that was never loaded, so its balance stays where it is", r.Account)
+	} else if _, err := g_LoginDatabase.Exec(
+		"UPDATE accounts SET cash = ?, cash_total = ?, vip = ?, vip_until = ? WHERE id = ?",
+		r.Cash, r.CashTotal, r.Vip, r.VipUntil, r.Account); err != nil {
+		log.Errorf("[ACCOUNT] %d could not be archived: %v", r.Account, err)
+	}
+
+	saved, err := result.RowsAffected()
+	if err != nil {
+		log.Errorf("[CHARACTER] %d archive reported no row count: %v", r.Id, err)
+		*s = res
+		return nil
+	}
+
+	res.Saved = int(saved)
+	*s = res
+	return nil
+}
